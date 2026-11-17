@@ -1,14 +1,21 @@
 const fs = require('fs');
 const path = require('path');
 const { getToken } = require('./token_reader');
+const routeGen = require('./route_gen');
 
 const BASE = 'https://mp.schoopia.com/adm/sport/applet/';
 const LOG = path.join(__dirname, 'campus_auto_run.log');
 const TRACK = path.join(__dirname, 'reference_run_safe.json');
+const LAST_ROUTE = path.join(__dirname, 'last_route.json');
 const APPID = 'wxb3cc2fbb0d37a32b';
-const MAX_POINTS = 241;
-const POINT_INTERVAL = 5; // seconds, same as a normal run
+const VERSION = '2.0 随机路线版';
+const POINT_INTERVAL = routeGen.STEP_SECONDS; // 5 秒一个点，和真跑一致
 const NOTICE = '黄河科技学院特供。本工具完全免费并在 GitHub 开源，禁止倒卖；如您是付费获取，请联系卖家退款。';
+
+// ==== 可调参数 ====
+// 走完一遍校园主路后额外加跑的距离（米），每趟在区间内随机
+const EXTRA_MIN_M = 0;
+const EXTRA_MAX_M = 700;
 
 function log(...args) {
   const line = new Date().toISOString() + ' ' + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
@@ -51,8 +58,45 @@ function localTimeOk() {
   return h >= 6 && h < 23;
 }
 
+function loadCorridor() {
+  const trackData = JSON.parse(fs.readFileSync(TRACK, 'utf8'));
+  return routeGen.buildCorridor(trackData.trackInfo);
+}
+
+/** 生成一条随机路线；--preview 时用于离线预演，不联网 */
+function makeRoute(corridor) {
+  const extra = EXTRA_MIN_M + Math.random() * (EXTRA_MAX_M - EXTRA_MIN_M);
+  return routeGen.generateRoute(corridor, {extraMeters: extra});
+}
+
+function fmtTime(sec) {
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return m + ' 分 ' + String(s).padStart(2, '0') + ' 秒';
+}
+
+// ==== 离线预览：node campus_auto_run.js --preview [次数] ====
+if (process.argv.includes('--preview')) {
+  const idx = process.argv.indexOf('--preview');
+  const count = Math.max(1, parseInt(process.argv[idx + 1], 10) || 3);
+  if (!fs.existsSync(TRACK)) { console.log('缺少 reference_run_safe.json'); process.exit(6); }
+  const corridor = loadCorridor();
+  console.log('校园主路长度 ' + corridor.len.toFixed(0) + ' m，开始生成 ' + count + ' 条随机路线：');
+  const out = [];
+  for (let k = 0; k < count; k++) {
+    const route = makeRoute(corridor);
+    const sum = routeGen.summarize(route);
+    console.log(`  #${k + 1} 起点弧长 ${route.startS} m，折返 ${route.turns} 次，` +
+      `${sum.points} 个点，${sum.distanceMeters} m，${sum.minutes} 分钟，配速 ${sum.paceMinPerKm} 分/公里`);
+    out.push({meta: {distance: sum.distanceMeters, seconds: sum.seconds, startS: route.startS, turns: route.turns}, points: route.points});
+  }
+  fs.writeFileSync(LAST_ROUTE, JSON.stringify(out, null, 1));
+  console.log('已写入 ' + LAST_ROUTE);
+  process.exit(0);
+}
+
 (async () => {
   log('=== 校园跑自动任务开始 ===');
+  log('版本', VERSION);
   log(NOTICE);
   const token = getToken();
   if (!token) { log('未找到登录 Token，请先在微信里打开一次“翻转任务跑”'); return 2; }
@@ -60,8 +104,15 @@ function localTimeOk() {
   if (!localTimeOk()) { log('当前不在 06:00-23:00 有效时段，跳过'); return 3; }
 
   if (!fs.existsSync(TRACK)) { log('缺少 reference_run_safe.json，请先放入自己的轨迹文件'); return 6; }
-  const trackData = JSON.parse(fs.readFileSync(TRACK, 'utf8'));
-  const pts = trackData.trackInfo.slice(0, MAX_POINTS);
+
+  // 本次随机生成一条新路线：起点、方向、折返点、左右偏移、速度抖动全部随机
+  const corridor = loadCorridor();
+  const route = makeRoute(corridor);
+  const sum = routeGen.summarize(route);
+  const pts = route.points;
+  log('本次路线', '起点弧长', route.startS, 'm', '折返', route.turns, '次',
+    '点数', sum.points, '路程', sum.distanceMeters, 'm', '预计', fmtTime(sum.seconds), '配速', sum.paceMinPerKm, '分/公里');
+  try { fs.writeFileSync(LAST_ROUTE, JSON.stringify({meta: sum, points: pts}, null, 1)); } catch {}
 
   const nowInfo = await post(token, 'get/now/running/info?type=1');
   if (nowInfo.j.success && nowInfo.j.data && nowInfo.j.data.runningFlag) {
